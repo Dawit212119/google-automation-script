@@ -1,0 +1,1350 @@
+/**
+ * Google Apps Script - Automated Scheduling System
+ * 
+ * This script automates meeting scheduling from Google Form submissions.
+ * It handles time zones, DST, calendar availability, event creation, and email confirmations.
+ * 
+ * SETUP INSTRUCTIONS:
+ * 1. Create a Google Form with the required fields (see documentation)
+ * 2. Create a Google Sheet linked to the form
+ * 3. Add the required columns to the sheet (see documentation)
+ * 4. Copy this entire script to Google Apps Script editor
+ * 5. Update the CONFIGURATION section below with your details
+ * 6. Set up the onFormSubmit trigger (see setup instructions at bottom)
+ */
+
+// ============================================================================
+// CONFIGURATION - UPDATE THESE VALUES
+// ============================================================================
+
+const CONFIG = {
+  // Your email address (the scheduler)
+  SCHEDULER_EMAIL: 'your-email@gmail.com',
+  
+  // Calendar ID - usually your email, or use 'primary' for default calendar
+  CALENDAR_ID: 'primary',
+  
+  // Meeting duration in minutes
+  MEETING_DURATION_MINUTES: 30,
+  
+  // Available time slots (24-hour format, in your timezone)
+  // Format: { start: '09:00', end: '17:00' } - means 9 AM to 5 PM
+  WORKING_HOURS: {
+    start: '09:00',
+    end: '17:00'
+  },
+  
+  // Days of week (0 = Sunday, 1 = Monday, ..., 6 = Saturday)
+  WORKING_DAYS: [1, 2, 3, 4, 5], // Monday to Friday
+  
+  // Buffer time between meetings (minutes)
+  BUFFER_TIME_MINUTES: 15,
+  
+  // How many days ahead to look for available slots
+  DAYS_AHEAD_TO_SEARCH: 14,
+  
+  // Event title template (use {name} for participant name)
+  EVENT_TITLE: 'Meeting with {name}',
+  
+  // Event description template
+  EVENT_DESCRIPTION: 'Meeting scheduled via form submission.\n\nParticipant Details:\nName: {name}\nEmail: {email}\nPhone: {phone}\nProfile: {profile}\nNotes: {notes}',
+  
+  // Email subject template
+  EMAIL_SUBJECT: 'Meeting Confirmation - {date}',
+  
+  // Email body template
+  EMAIL_BODY: `Hello {name},
+
+Your meeting has been scheduled for:
+Date: {date}
+Time: {time} ({timezone})
+
+Meeting Link: {meetingLink}
+
+We look forward to speaking with you!
+
+Best regards,
+Automated Scheduling System`,
+  
+  // Reminder minutes before meeting
+  REMINDER_MINUTES: [10, 30],
+  
+  // Sheet name (tab name in your spreadsheet)
+  SHEET_NAME: 'Form Responses 1', // Default name, change if different
+};
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const STATUS = {
+  PENDING: 'Pending',
+  PROCESSING: 'Processing',
+  CONFIRMED: 'Confirmed',
+  REJECTED: 'Rejected',
+  ERROR: 'Error'
+};
+
+const TIME_WINDOWS = {
+  MORNING: { start: 9 * 60, end: 12 * 60 },    // 9 AM to 12 PM
+  AFTERNOON: { start: 12 * 60, end: 17 * 60 }, // 12 PM to 5 PM
+  EVENING: { start: 17 * 60, end: 20 * 60 }    // 5 PM to 8 PM
+};
+
+const SLOT_INCREMENT_MINUTES = 15;
+
+// ============================================================================
+// COLUMN MAPPING - Update if your sheet columns are different
+// 
+// ⚠️ CRITICAL: ORDER MATTERS!
+// The script reads data by COLUMN POSITION (index), NOT by header names.
+// 
+// Form fields MUST be in this exact order:
+//   1. Name
+//   2. Email
+//   3. Profile Link
+//   4. Phone Number
+//   5. Additional Notes
+//   6. Preferred Time Window
+//   7. Preferred Dates
+//
+// Spreadsheet columns MUST be in this exact order (A-N):
+//   A: Timestamp (auto-filled by Forms)
+//   B: Name (auto-filled by Forms)
+//   C: Email (auto-filled by Forms)
+//   D: Profile Link (auto-filled by Forms)
+//   E: Phone (auto-filled by Forms)
+//   F: Notes (auto-filled by Forms)
+//   G: Preferred Time Window (auto-filled by Forms)
+//   H: Preferred Dates (auto-filled by Forms)
+//   I: Status (filled by script)
+//   J: Meeting Time (filled by script)
+//   K: Assigned Slot (ISO) (filled by script)
+//   L: Timezone (filled by script)
+//   M: Calendar Event ID (filled by script)
+//   N: Log (filled by script)
+//
+// NOTE: Data starts from ROW 1 (not row 2)
+// If your sheet has headers, they should be in a separate row or handled separately
+//
+// If you change the order, you MUST update these indices accordingly!
+// ============================================================================
+
+const COLUMNS = {
+  TIMESTAMP: 0,              // Column A (0-indexed)
+  NAME: 1,                   // Column B
+  EMAIL: 2,                  // Column C
+  PROFILE_LINK: 3,           // Column D
+  PHONE: 4,                  // Column E
+  NOTES: 5,                  // Column F
+  PREFERRED_TIME_WINDOW: 6,  // Column G
+  PREFERRED_DATES: 7,        // Column H
+  STATUS: 8,                 // Column I
+  MEETING_TIME: 9,           // Column J
+  ASSIGNED_SLOT_ISO: 10,     // Column K
+  TIMEZONE: 11,              // Column L
+  CALENDAR_EVENT_ID: 12,     // Column M
+  LOG: 13,                   // Column N
+};
+
+// ============================================================================
+// MAIN TRIGGER FUNCTION
+// ============================================================================
+
+/**
+ * Triggered automatically when a form is submitted
+ * @param {GoogleAppsScript.Events.FormsOnFormSubmit} e - Form submit event
+ */
+function onFormSubmit(e) {
+  try {
+    logSection('FORM SUBMISSION TRIGGERED');
+    
+    const sheet = getSheet();
+    if (!sheet) return;
+    
+    const { formData, targetRow } = extractFormData(sheet, e);
+    if (!formData || !targetRow) return;
+    
+    if (!validateFormData(formData, targetRow, sheet)) return;
+    
+    processSubmission(sheet, formData, targetRow);
+    
+  } catch (error) {
+    handleError(error, e);
+  }
+}
+
+// ============================================================================
+// DATA EXTRACTION & VALIDATION
+// ============================================================================
+
+/**
+ * Extracts form data from event or sheet
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @param {GoogleAppsScript.Events.FormsOnFormSubmit} e - Form submit event
+ * @return {Object} Object with formData and targetRow, or null values if failed
+ */
+function extractFormData(sheet, e) {
+  let targetRow = getTargetRowFromEvent(e);
+  
+  if (targetRow) {
+    if (isHeaderRow(sheet, targetRow)) {
+      Logger.log('Row ' + targetRow + ' appears to be headers - Skipping');
+      return { formData: null, targetRow: null };
+    }
+    
+    if (isAlreadyProcessed(sheet, targetRow)) {
+      return { formData: null, targetRow: null };
+    }
+    
+    const formData = readFormDataFromEvent(e, targetRow, sheet);
+    if (formData && isValidFormData(formData)) {
+      return { formData, targetRow };
+    }
+    
+    Logger.log('⚠️ Row ' + targetRow + ' from event appears to be empty');
+    targetRow = null; // Trigger fallback search
+  }
+  
+  // Fallback: find last row with data
+  if (!targetRow) {
+    targetRow = findLastDataRow(sheet);
+    if (!targetRow) {
+      Logger.log('ERROR: No data rows found with valid name and email.');
+      return { formData: null, targetRow: null };
+    }
+  }
+  
+  const formData = readFormData(sheet, targetRow);
+  Logger.log('✓ Using row ' + targetRow + ' as target');
+  
+  return { formData, targetRow };
+}
+
+/**
+ * Gets target row from form submit event
+ * @param {GoogleAppsScript.Events.FormsOnFormSubmit} e - Form submit event
+ * @return {number|null} Row number or null
+ */
+function getTargetRowFromEvent(e) {
+  if (!e) return null;
+  
+  if (e.range) {
+    const row = e.range.getRow();
+    Logger.log('✓ Form submitted to row: ' + row + ' (FROM EVENT RANGE)');
+    return row;
+  }
+  
+  Logger.log('⚠️ Event range not available');
+  return null;
+}
+
+/**
+ * Reads form data from event or sheet
+ * @param {GoogleAppsScript.Events.FormsOnFormSubmit} e - Form submit event
+ * @param {number} targetRow - Target row number
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @return {Object|null} Form data object or null
+ */
+function readFormDataFromEvent(e, targetRow, sheet) {
+  if (e && e.values && e.values.length > 0) {
+    const nameFromEvent = safeString(e.values[COLUMNS.NAME]);
+    const emailFromEvent = safeString(e.values[COLUMNS.EMAIL]);
+    
+    if (nameFromEvent && emailFromEvent && emailFromEvent.includes('@')) {
+      Logger.log('Using event values (name: ' + nameFromEvent + ', email: ' + emailFromEvent + ')');
+      return createFormDataFromValues(e.values);
+    }
+  }
+  
+  Logger.log('Reading from sheet row ' + targetRow);
+  return readFormData(sheet, targetRow);
+}
+
+/**
+ * Creates form data object from event values
+ * @param {Array} values - Event values array
+ * @return {Object} Form data object
+ */
+function createFormDataFromValues(values) {
+  return {
+    timestamp: values[COLUMNS.TIMESTAMP] || new Date(),
+    name: safeString(values[COLUMNS.NAME]),
+    email: safeString(values[COLUMNS.EMAIL]),
+    profileLink: safeString(values[COLUMNS.PROFILE_LINK]),
+    phone: safeString(values[COLUMNS.PHONE]),
+    notes: safeString(values[COLUMNS.NOTES]),
+    preferredTimeWindow: safeString(values[COLUMNS.PREFERRED_TIME_WINDOW]),
+    preferredDates: safeString(values[COLUMNS.PREFERRED_DATES]),
+    status: STATUS.PENDING,
+    meetingTime: '',
+    assignedSlotISO: '',
+    timezone: '',
+    calendarEventId: '',
+    log: '',
+  };
+}
+
+/**
+ * Finds the last row with valid data
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @return {number|null} Row number or null
+ */
+function findLastDataRow(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 1) {
+    Logger.log('ERROR: No rows found. Sheet is empty.');
+    return null;
+  }
+  
+  const firstDataRow = getFirstDataRow(sheet);
+  Logger.log('First data row (after headers): ' + firstDataRow);
+  
+  for (let r = lastRow; r >= firstDataRow; r--) {
+    if (isHeaderRow(sheet, r)) continue;
+    
+    const testData = readFormData(sheet, r);
+    if (isValidFormData(testData)) {
+      Logger.log('✓ Found last row with data: ' + r);
+      return r;
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Validates form data has required fields
+ * @param {Object} formData - Form data object
+ * @return {boolean} True if valid
+ */
+function isValidFormData(formData) {
+  if (!formData) return false;
+  
+  const name = safeString(formData.name);
+  const email = safeString(formData.email);
+  
+  return name && email && email.includes('@');
+}
+
+/**
+ * Validates form data and target row
+ * @param {Object} formData - Form data object
+ * @param {number} targetRow - Target row number
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @return {boolean} True if valid
+ */
+function validateFormData(formData, targetRow, sheet) {
+  if (!targetRow || targetRow < 1) {
+    Logger.log('ERROR: Invalid target row: ' + targetRow);
+    return false;
+  }
+  
+  if (isHeaderRow(sheet, targetRow)) {
+    Logger.log('ERROR: Target row ' + targetRow + ' appears to be headers');
+    return false;
+  }
+  
+  if (!isValidFormData(formData)) {
+    Logger.log('ERROR: Row ' + targetRow + ' is empty or missing required fields');
+    updateSheetStatus(sheet, targetRow, STATUS.ERROR, 'Missing required fields: Name and Email are required');
+    return false;
+  }
+  
+  if (isAlreadyProcessed(sheet, targetRow)) {
+    Logger.log('Submission already processed, skipping');
+    return false;
+  }
+  
+  return true;
+}
+
+/**
+ * Checks if row is already processed
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @param {number} row - Row number
+ * @return {boolean} True if already processed
+ */
+function isAlreadyProcessed(sheet, row) {
+  const status = sheet.getRange(row, COLUMNS.STATUS + 1).getValue();
+  return status === STATUS.CONFIRMED || status === STATUS.REJECTED;
+}
+
+/**
+ * Gets the sheet object
+ * @return {GoogleAppsScript.Spreadsheet.Sheet|null} Sheet object or null
+ */
+function getSheet() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME);
+  if (!sheet) {
+    throw new Error(`Sheet "${CONFIG.SHEET_NAME}" not found`);
+  }
+  return sheet;
+}
+
+// ============================================================================
+// DATA READING FUNCTIONS
+// ============================================================================
+
+/**
+ * Detects if a row contains headers (not actual data)
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @param {number} row - Row number to check
+ * @return {boolean} True if the row appears to be headers
+ */
+function isHeaderRow(sheet, row) {
+  try {
+    const range = sheet.getRange(row, 1, 1, COLUMNS.LOG + 1);
+    const values = range.getValues()[0];
+    
+    const nameValue = safeString(values[COLUMNS.NAME]);
+    const emailValue = safeString(values[COLUMNS.EMAIL]);
+    const timestampValue = safeString(values[COLUMNS.TIMESTAMP]);
+    
+    // If email contains @, it's definitely NOT a header
+    if (emailValue.includes('@')) return false;
+    
+    // If name looks like a real name, it's probably data
+    if (nameValue.length > 10 || nameValue.includes(' ')) return false;
+    
+    // Check header patterns
+    const headerPatterns = {
+      name: ['name', 'full name', 'participant name', 'user name', 'your name'],
+      email: ['email', 'e-mail', 'email address', 'e-mail address', 'your email'],
+      timestamp: ['timestamp', 'date', 'submitted', 'time', 'submission time']
+    };
+    
+    const nameIsHeader = headerPatterns.name.some(p => 
+      nameValue.toLowerCase() === p.toLowerCase()
+    );
+    const emailIsHeader = headerPatterns.email.some(p => 
+      emailValue.toLowerCase() === p.toLowerCase()
+    );
+    const timestampIsHeader = headerPatterns.timestamp.some(p => 
+      timestampValue.toLowerCase() === p.toLowerCase()
+    );
+    
+    return nameIsHeader && emailIsHeader && timestampIsHeader;
+  } catch (e) {
+    Logger.log('Error checking if row is header: ' + e.toString());
+    return false;
+  }
+}
+
+/**
+ * Gets the first data row (skips headers if they exist)
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @return {number} Row number where data starts (1 or 2)
+ */
+function getFirstDataRow(sheet) {
+  return isHeaderRow(sheet, 1) ? 2 : 1;
+}
+
+/**
+ * Reads form data from the sheet
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @param {number} row - Row number to read
+ * @return {Object} Form data object
+ */
+function readFormData(sheet, row) {
+  const range = sheet.getRange(row, 1, 1, COLUMNS.LOG + 1);
+  const values = range.getValues()[0];
+  
+  return {
+    timestamp: values[COLUMNS.TIMESTAMP],
+    name: safeString(values[COLUMNS.NAME]),
+    email: safeString(values[COLUMNS.EMAIL]),
+    profileLink: safeString(values[COLUMNS.PROFILE_LINK]),
+    phone: safeString(values[COLUMNS.PHONE]),
+    notes: safeString(values[COLUMNS.NOTES]),
+    preferredTimeWindow: safeString(values[COLUMNS.PREFERRED_TIME_WINDOW]),
+    preferredDates: safeString(values[COLUMNS.PREFERRED_DATES]),
+    status: safeString(values[COLUMNS.STATUS]) || STATUS.PENDING,
+    meetingTime: safeString(values[COLUMNS.MEETING_TIME]),
+    assignedSlotISO: safeString(values[COLUMNS.ASSIGNED_SLOT_ISO]),
+    timezone: safeString(values[COLUMNS.TIMEZONE]),
+    calendarEventId: safeString(values[COLUMNS.CALENDAR_EVENT_ID]),
+    log: safeString(values[COLUMNS.LOG]),
+  };
+}
+
+// ============================================================================
+// SUBMISSION PROCESSING
+// ============================================================================
+
+/**
+ * Processes a form submission
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @param {Object} formData - Form submission data
+ * @param {number} targetRow - Target row number
+ */
+function processSubmission(sheet, formData, targetRow) {
+  logSection('PROCESSING SUBMISSION', `Row ${targetRow}: ${formData.name} (${formData.email})`);
+  
+  updateSheetStatus(sheet, targetRow, STATUS.PROCESSING, `Processing started at ${new Date().toLocaleString()}`);
+  
+  const userTimezone = detectTimezone(formData.email) || Session.getScriptTimeZone();
+  const meetingSlot = findAvailableSlot(userTimezone, formData.preferredTimeWindow, formData.preferredDates);
+  
+  if (!meetingSlot) {
+    handleNoSlotAvailable(sheet, targetRow, formData);
+    return;
+  }
+  
+  const event = createCalendarEvent(formData, meetingSlot);
+  if (!event) {
+    updateSheetStatus(sheet, targetRow, STATUS.ERROR, 'Failed to create calendar event');
+    return;
+  }
+  
+  updateSheetWithMeetingDetails(sheet, targetRow, formData, meetingSlot, event, userTimezone);
+  sendConfirmationEmail(formData, meetingSlot, event);
+  
+  logSection('PROCESSING COMPLETED', `Row ${targetRow} - Status: ${STATUS.CONFIRMED}`);
+}
+
+/**
+ * Handles case when no slot is available
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @param {number} targetRow - Target row number
+ * @param {Object} formData - Form submission data
+ */
+function handleNoSlotAvailable(sheet, targetRow, formData) {
+  const message = `No available slots found. Searched ${CONFIG.DAYS_AHEAD_TO_SEARCH} days ahead.`;
+  updateSheetStatus(sheet, targetRow, STATUS.REJECTED, message);
+  sendRejectionEmail(formData);
+}
+
+/**
+ * Updates sheet with meeting details
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @param {number} targetRow - Target row number
+ * @param {Object} formData - Form submission data
+ * @param {Object} meetingSlot - Meeting slot
+ * @param {GoogleAppsScript.Calendar.CalendarEvent} event - Calendar event
+ * @param {string} userTimezone - User's timezone
+ */
+function updateSheetWithMeetingDetails(sheet, targetRow, formData, meetingSlot, event, userTimezone) {
+  const meetingTimeFormatted = formatDateTime(meetingSlot.startTime, userTimezone);
+  const assignedSlotISO = meetingSlot.startTime.toISOString();
+  
+  updateCell(sheet, targetRow, COLUMNS.STATUS, STATUS.CONFIRMED);
+  updateCell(sheet, targetRow, COLUMNS.MEETING_TIME, meetingTimeFormatted);
+  updateCell(sheet, targetRow, COLUMNS.ASSIGNED_SLOT_ISO, assignedSlotISO);
+  updateCell(sheet, targetRow, COLUMNS.TIMEZONE, userTimezone);
+  updateCell(sheet, targetRow, COLUMNS.CALENDAR_EVENT_ID, event.getId());
+  updateCell(sheet, targetRow, COLUMNS.LOG, `Event created successfully. Event ID: ${event.getId()}`);
+  
+  Logger.log('Meeting scheduled for: ' + meetingTimeFormatted);
+}
+
+/**
+ * Updates sheet status and log
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The spreadsheet sheet
+ * @param {number} row - Row number
+ * @param {string} status - Status value
+ * @param {string} logMessage - Log message
+ */
+function updateSheetStatus(sheet, row, status, logMessage) {
+  updateCell(sheet, row, COLUMNS.STATUS, status);
+  updateCell(sheet, row, COLUMNS.LOG, logMessage);
+}
+
+// ============================================================================
+// TIMEZONE FUNCTIONS
+// ============================================================================
+
+/**
+ * Detects timezone from email domain or user data
+ * @param {string} email - User email
+ * @return {string} Timezone string in IANA format
+ */
+function detectTimezone(email) {
+  // Default to script timezone
+  // Can be enhanced with timezone detection service or form field
+  return Session.getScriptTimeZone();
+}
+
+/**
+ * Converts a time in one timezone to another
+ * @param {Date} date - Date object
+ * @param {string} fromTimezone - Source timezone (IANA format)
+ * @param {string} toTimezone - Target timezone (IANA format)
+ * @return {Date} Converted date
+ */
+function convertTimezone(date, fromTimezone, toTimezone) {
+  const fromOffset = Utilities.formatDate(date, fromTimezone, 'Z');
+  const toOffset = Utilities.formatDate(date, toTimezone, 'Z');
+  
+  const fromHours = parseInt(fromOffset.substring(1, 3)) + parseInt(fromOffset.substring(3, 5)) / 60;
+  const toHours = parseInt(toOffset.substring(1, 3)) + parseInt(toOffset.substring(3, 5)) / 60;
+  const offsetDiff = (fromOffset[0] === '-' ? -1 : 1) * fromHours - (toOffset[0] === '-' ? -1 : 1) * toHours;
+  
+  const result = new Date(date);
+  result.setHours(result.getHours() - offsetDiff);
+  return result;
+}
+
+/**
+ * Checks if a date is in daylight saving time
+ * @param {Date} date - Date to check
+ * @param {string} timezone - Timezone string
+ * @return {boolean} True if DST is active
+ */
+function isDST(date, timezone) {
+  const jan = new Date(date.getFullYear(), 0, 1);
+  const jul = new Date(date.getFullYear(), 6, 1);
+  
+  const janOffset = Utilities.formatDate(jan, timezone, 'Z');
+  const julOffset = Utilities.formatDate(jul, timezone, 'Z');
+  const currentOffset = Utilities.formatDate(date, timezone, 'Z');
+  
+  return currentOffset === julOffset;
+}
+
+// ============================================================================
+// PREFERENCE PARSING FUNCTIONS
+// ============================================================================
+
+/**
+ * Parses preferred dates from various input formats
+ * @param {string|Date|Array|Object} preferredDatesInput - Date input
+ * @return {Array<Date>} Array of Date objects
+ */
+function parsePreferredDates(preferredDatesInput) {
+  if (!preferredDatesInput) return [];
+  
+  if (preferredDatesInput instanceof Date) {
+    return !isNaN(preferredDatesInput.getTime()) ? [preferredDatesInput] : [];
+  }
+  
+  if (Array.isArray(preferredDatesInput)) {
+    return preferredDatesInput
+      .map(item => {
+        if (item instanceof Date && !isNaN(item.getTime())) return item;
+        if (typeof item === 'string' && item.trim()) return parseDateString(item.trim());
+        return null;
+      })
+      .filter(date => date !== null);
+  }
+  
+  const preferredDatesStr = String(preferredDatesInput).trim();
+  if (preferredDatesStr === '' || preferredDatesStr === 'undefined' || preferredDatesStr === 'null') {
+    return [];
+  }
+  
+  return preferredDatesStr
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => s !== '')
+    .map(dateStr => {
+      try {
+        return parseDateString(dateStr);
+      } catch (e) {
+        Logger.log('Error parsing date: ' + dateStr + ' - ' + e.toString());
+        return null;
+      }
+    })
+    .filter(date => date !== null);
+}
+
+/**
+ * Parses a single date string
+ * @param {string} dateStr - Date string to parse
+ * @return {Date|null} Parsed Date object or null if invalid
+ */
+function parseDateString(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+  
+  dateStr = dateStr.trim();
+  if (dateStr === '') return null;
+  
+  let date;
+  
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    date = new Date(dateStr + 'T00:00:00');
+  } else if (/^\d{4}-\d{2}-\d{2}T/.test(dateStr)) {
+    date = new Date(dateStr);
+  } else if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(dateStr)) {
+    const parts = dateStr.split('/');
+    date = new Date(parseInt(parts[2]), parseInt(parts[0]) - 1, parseInt(parts[1]));
+  } else {
+    date = new Date(dateStr);
+  }
+  
+  return !isNaN(date.getTime()) ? date : null;
+}
+
+/**
+ * Gets time window constraints based on preference
+ * @param {string} preferredTimeWindow - Time window preference
+ * @param {string} userTimezone - User's timezone
+ * @return {Object|null} Object with start and end minutes from midnight, or null
+ */
+function getTimeWindowConstraints(preferredTimeWindow, userTimezone) {
+  if (!preferredTimeWindow || preferredTimeWindow.trim() === '') return null;
+  
+  const window = preferredTimeWindow.toLowerCase().trim();
+  
+  if (window.includes('morning')) return TIME_WINDOWS.MORNING;
+  if (window.includes('afternoon')) return TIME_WINDOWS.AFTERNOON;
+  if (window.includes('evening')) return TIME_WINDOWS.EVENING;
+  if (window.includes('anytime') || window.includes('any time')) return null;
+  
+  return null;
+}
+
+/**
+ * Generates an array of dates from now to N days ahead
+ * @param {Date} startDate - Starting date
+ * @param {number} daysAhead - Number of days to generate
+ * @return {Array<Date>} Array of Date objects
+ */
+function generateDateRange(startDate, daysAhead) {
+  const dates = [];
+  for (let i = 0; i < daysAhead; i++) {
+    const date = new Date(startDate);
+    date.setDate(date.getDate() + i);
+    date.setHours(0, 0, 0, 0);
+    dates.push(date);
+  }
+  return dates;
+}
+
+/**
+ * Checks if two dates are on the same day
+ * @param {Date} date1 - First date
+ * @param {Date} date2 - Second date
+ * @return {boolean} True if same day
+ */
+function isSameDay(date1, date2) {
+  return date1.getFullYear() === date2.getFullYear() &&
+         date1.getMonth() === date2.getMonth() &&
+         date1.getDate() === date2.getDate();
+}
+
+// ============================================================================
+// CALENDAR AVAILABILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Finds the next available meeting slot considering user preferences
+ * @param {string} userTimezone - User's timezone
+ * @param {string} preferredTimeWindow - User's preferred time window
+ * @param {string} preferredDates - User's preferred dates
+ * @return {Object|null} Meeting slot object with startTime and endTime, or null
+ */
+function findAvailableSlot(userTimezone, preferredTimeWindow, preferredDates) {
+  const calendar = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
+  const now = new Date();
+  const schedulerTimezone = Session.getScriptTimeZone();
+  
+  const preferredDatesList = parsePreferredDates(preferredDates);
+  const datesToSearch = preferredDatesList.length > 0 
+    ? preferredDatesList 
+    : generateDateRange(now, CONFIG.DAYS_AHEAD_TO_SEARCH);
+  
+  // Search preferred dates first
+  for (const checkDate of datesToSearch) {
+    if (!isValidSearchDate(checkDate, now)) continue;
+    
+    const slot = findSlotForDate(calendar, checkDate, preferredTimeWindow, userTimezone, schedulerTimezone);
+    if (slot) return slot;
+  }
+  
+  // If preferred dates didn't work, try general search
+  if (preferredDatesList.length > 0) {
+    const generalDates = generateDateRange(now, CONFIG.DAYS_AHEAD_TO_SEARCH);
+    for (const checkDate of generalDates) {
+      if (preferredDatesList.some(pd => isSameDay(pd, checkDate))) continue;
+      if (!isValidSearchDate(checkDate, now)) continue;
+      
+      const slot = findSlotForDate(calendar, checkDate, preferredTimeWindow, userTimezone, schedulerTimezone);
+      if (slot) return slot;
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Checks if a date is valid for searching
+ * @param {Date} checkDate - Date to check
+ * @param {Date} now - Current date
+ * @return {boolean} True if valid
+ */
+function isValidSearchDate(checkDate, now) {
+  return CONFIG.WORKING_DAYS.includes(checkDate.getDay()) && checkDate >= now;
+}
+
+/**
+ * Finds a slot for a specific date
+ * @param {GoogleAppsScript.Calendar.Calendar} calendar - Calendar object
+ * @param {Date} checkDate - Date to check
+ * @param {string} preferredTimeWindow - Preferred time window
+ * @param {string} userTimezone - User's timezone
+ * @param {string} schedulerTimezone - Scheduler's timezone
+ * @return {Object|null} Available slot or null
+ */
+function findSlotForDate(calendar, checkDate, preferredTimeWindow, userTimezone, schedulerTimezone) {
+  const timeWindow = getTimeWindowConstraints(preferredTimeWindow, userTimezone);
+  const { dayStartUserTZ, dayEndUserTZ } = getDayTimeRange(checkDate, schedulerTimezone, userTimezone);
+  
+  const { searchStart, searchEnd } = applyTimeWindowPreference(
+    dayStartUserTZ, 
+    dayEndUserTZ, 
+    timeWindow
+  );
+  
+  return findSlotInDay(calendar, searchStart, searchEnd, userTimezone);
+}
+
+/**
+ * Gets day time range in user's timezone
+ * @param {Date} checkDate - Date to check
+ * @param {string} schedulerTimezone - Scheduler's timezone
+ * @param {string} userTimezone - User's timezone
+ * @return {Object} Object with dayStartUserTZ and dayEndUserTZ
+ */
+function getDayTimeRange(checkDate, schedulerTimezone, userTimezone) {
+  const [startHour, startMinute] = CONFIG.WORKING_HOURS.start.split(':').map(Number);
+  const [endHour, endMinute] = CONFIG.WORKING_HOURS.end.split(':').map(Number);
+  
+  const dayStart = new Date(checkDate);
+  dayStart.setHours(startHour, startMinute, 0, 0);
+  const dayStartUserTZ = convertTimezone(dayStart, schedulerTimezone, userTimezone);
+  
+  const dayEnd = new Date(checkDate);
+  dayEnd.setHours(endHour, endMinute, 0, 0);
+  const dayEndUserTZ = convertTimezone(dayEnd, schedulerTimezone, userTimezone);
+  
+  return { dayStartUserTZ, dayEndUserTZ };
+}
+
+/**
+ * Applies time window preference to day range
+ * @param {Date} dayStartUserTZ - Day start in user timezone
+ * @param {Date} dayEndUserTZ - Day end in user timezone
+ * @param {Object|null} timeWindow - Time window constraints
+ * @return {Object} Object with searchStart and searchEnd
+ */
+function applyTimeWindowPreference(dayStartUserTZ, dayEndUserTZ, timeWindow) {
+  if (!timeWindow) {
+    return { searchStart: dayStartUserTZ, searchEnd: dayEndUserTZ };
+  }
+  
+  let searchStart = new Date(dayStartUserTZ);
+  let searchEnd = new Date(dayStartUserTZ);
+  
+  if (timeWindow.start !== null) {
+    searchStart.setHours(Math.floor(timeWindow.start / 60), timeWindow.start % 60, 0, 0);
+  }
+  
+  if (timeWindow.end !== null) {
+    searchEnd.setHours(Math.floor(timeWindow.end / 60), timeWindow.end % 60, 0, 0);
+  }
+  
+  return { searchStart, searchEnd };
+}
+
+/**
+ * Finds an available slot within a specific day
+ * @param {GoogleAppsScript.Calendar.Calendar} calendar - Calendar object
+ * @param {Date} dayStart - Start of day in user timezone
+ * @param {Date} dayEnd - End of day in user timezone
+ * @param {string} userTimezone - User's timezone
+ * @return {Object|null} Available slot or null
+ */
+function findSlotInDay(calendar, dayStart, dayEnd, userTimezone) {
+  const schedulerTimezone = Session.getScriptTimeZone();
+  const durationMs = CONFIG.MEETING_DURATION_MINUTES * 60 * 1000;
+  const bufferMs = CONFIG.BUFFER_TIME_MINUTES * 60 * 1000;
+  
+  const dayStartSchedulerTZ = convertTimezone(dayStart, userTimezone, schedulerTimezone);
+  const dayEndSchedulerTZ = convertTimezone(dayEnd, userTimezone, schedulerTimezone);
+  
+  const existingEvents = calendar.getEvents(dayStartSchedulerTZ, dayEndSchedulerTZ);
+  existingEvents.sort((a, b) => a.getStartTime().getTime() - b.getStartTime().getTime());
+  
+  let currentSlotStart = new Date(dayStart);
+  
+  while (currentSlotStart.getTime() + durationMs <= dayEnd.getTime()) {
+    const currentSlotEnd = new Date(currentSlotStart.getTime() + durationMs);
+    
+    if (!hasConflict(currentSlotStart, currentSlotEnd, existingEvents, schedulerTimezone, userTimezone, bufferMs)) {
+      return {
+        startTime: new Date(currentSlotStart),
+        endTime: new Date(currentSlotEnd),
+      };
+    }
+    
+    currentSlotStart = new Date(currentSlotStart.getTime() + SLOT_INCREMENT_MINUTES * 60 * 1000);
+  }
+  
+  return null;
+}
+
+/**
+ * Checks if a slot conflicts with existing events
+ * @param {Date} slotStart - Slot start time
+ * @param {Date} slotEnd - Slot end time
+ * @param {Array} existingEvents - Array of existing calendar events
+ * @param {string} schedulerTimezone - Scheduler's timezone
+ * @param {string} userTimezone - User's timezone
+ * @param {number} bufferMs - Buffer time in milliseconds
+ * @return {boolean} True if conflict exists
+ */
+function hasConflict(slotStart, slotEnd, existingEvents, schedulerTimezone, userTimezone, bufferMs) {
+  const slotStartWithBuffer = new Date(slotStart.getTime() - bufferMs);
+  const slotEndWithBuffer = new Date(slotEnd.getTime() + bufferMs);
+  
+  return existingEvents.some(event => {
+    const eventStart = convertTimezone(event.getStartTime(), schedulerTimezone, userTimezone);
+    const eventEnd = convertTimezone(event.getEndTime(), schedulerTimezone, userTimezone);
+    return (eventStart < slotEndWithBuffer && eventEnd > slotStartWithBuffer);
+  });
+}
+
+// ============================================================================
+// CALENDAR EVENT FUNCTIONS
+// ============================================================================
+
+/**
+ * Creates a calendar event for the meeting
+ * @param {Object} formData - Form submission data
+ * @param {Object} meetingSlot - Meeting slot with startTime and endTime
+ * @return {GoogleAppsScript.Calendar.CalendarEvent|null} Created event or null
+ */
+function createCalendarEvent(formData, meetingSlot) {
+  try {
+    const calendar = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
+    const schedulerTimezone = Session.getScriptTimeZone();
+    const userTimezone = formData.timezone || Session.getScriptTimeZone();
+    
+    const eventStartSchedulerTZ = convertTimezone(meetingSlot.startTime, userTimezone, schedulerTimezone);
+    const eventEndSchedulerTZ = convertTimezone(meetingSlot.endTime, userTimezone, schedulerTimezone);
+    
+    const eventTitle = replaceTemplate(CONFIG.EVENT_TITLE, { name: formData.name });
+    const eventDescription = replaceTemplate(CONFIG.EVENT_DESCRIPTION, {
+      name: formData.name,
+      email: formData.email,
+      phone: formData.phone,
+      profile: formData.profileLink,
+      notes: formData.notes
+    });
+    
+    const guestEmail = safeString(formData.email);
+    if (!guestEmail || !guestEmail.includes('@')) {
+      throw new Error('Invalid or missing email address: ' + guestEmail);
+    }
+    
+    const event = calendar.createEvent(eventTitle, eventStartSchedulerTZ, eventEndSchedulerTZ, {
+      description: eventDescription
+    });
+    
+    event.addGuest(guestEmail);
+    event.setGuestsCanModify(false);
+    event.setGuestsCanInviteOthers(false);
+    
+    addConferenceLink(event);
+    addReminders(event);
+    
+    Logger.log('Calendar event created: ' + event.getId());
+    return event;
+    
+  } catch (error) {
+    Logger.log('Error creating calendar event: ' + error.toString());
+    return null;
+  }
+}
+
+/**
+ * Adds conference link to event
+ * @param {GoogleAppsScript.Calendar.CalendarEvent} event - Calendar event
+ */
+function addConferenceLink(event) {
+  try {
+    const ConferenceServiceType = CalendarApp.ConferenceServiceType;
+    if (ConferenceServiceType) {
+      if ('MEET' in ConferenceServiceType) {
+        event.addConferenceLink(ConferenceServiceType.MEET);
+      } else if ('HANGOUT' in ConferenceServiceType) {
+        event.addConferenceLink(ConferenceServiceType.HANGOUT);
+      }
+    }
+  } catch (conferenceError) {
+    Logger.log('Note: Conference link will be added automatically by Google Calendar when guests receive invites.');
+  }
+}
+
+/**
+ * Adds reminders to event
+ * @param {GoogleAppsScript.Calendar.CalendarEvent} event - Calendar event
+ */
+function addReminders(event) {
+  CONFIG.REMINDER_MINUTES.forEach(minutes => {
+    event.addPopupReminder(minutes);
+  });
+}
+
+// ============================================================================
+// EMAIL FUNCTIONS
+// ============================================================================
+
+/**
+ * Sends confirmation email to the participant
+ * @param {Object} formData - Form submission data
+ * @param {Object} meetingSlot - Meeting slot
+ * @param {GoogleAppsScript.Calendar.CalendarEvent} event - Calendar event
+ */
+function sendConfirmationEmail(formData, meetingSlot, event) {
+  try {
+    const userTimezone = formData.timezone || Session.getScriptTimeZone();
+    const meetingDate = formatDate(meetingSlot.startTime, userTimezone);
+    const meetingTime = formatTime(meetingSlot.startTime, userTimezone);
+    const meetingLink = event.getConferenceLink() || 'Check calendar event for meeting link';
+    
+    const emailSubject = replaceTemplate(CONFIG.EMAIL_SUBJECT, { date: meetingDate });
+    const emailBody = replaceTemplate(CONFIG.EMAIL_BODY, {
+      name: formData.name,
+      date: meetingDate,
+      time: meetingTime,
+      timezone: userTimezone,
+      meetingLink: meetingLink
+    });
+    
+    MailApp.sendEmail({
+      to: formData.email,
+      subject: emailSubject,
+      body: emailBody,
+      name: 'Automated Scheduling System',
+    });
+    
+    Logger.log('Confirmation email sent to: ' + formData.email);
+    
+  } catch (error) {
+    Logger.log('Error sending confirmation email: ' + error.toString());
+  }
+}
+
+/**
+ * Sends rejection email when no slots are available
+ * @param {Object} formData - Form submission data
+ */
+function sendRejectionEmail(formData) {
+  try {
+    const emailSubject = 'Meeting Request - No Available Slots';
+    const emailBody = `Hello ${formData.name},
+
+Thank you for your meeting request. Unfortunately, we are unable to find an available time slot in the next ${CONFIG.DAYS_AHEAD_TO_SEARCH} days.
+
+Please try submitting again at a later time, or contact us directly to schedule a meeting.
+
+Best regards,
+Automated Scheduling System`;
+    
+    MailApp.sendEmail({
+      to: formData.email,
+      subject: emailSubject,
+      body: emailBody,
+      name: 'Automated Scheduling System',
+    });
+    
+    Logger.log('Rejection email sent to: ' + formData.email);
+    
+  } catch (error) {
+    Logger.log('Error sending rejection email: ' + error.toString());
+  }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Updates a cell in the sheet
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Sheet object
+ * @param {number} row - Row number
+ * @param {number} col - Column number (0-indexed)
+ * @param {*} value - Value to set
+ */
+function updateCell(sheet, row, col, value) {
+  sheet.getRange(row, col + 1).setValue(value);
+}
+
+/**
+ * Formats a date for display
+ * @param {Date} date - Date object
+ * @param {string} timezone - Timezone string
+ * @return {string} Formatted date string
+ */
+function formatDate(date, timezone) {
+  return Utilities.formatDate(date, timezone, 'EEEE, MMMM d, yyyy');
+}
+
+/**
+ * Formats a time for display
+ * @param {Date} date - Date object
+ * @param {string} timezone - Timezone string
+ * @return {string} Formatted time string
+ */
+function formatTime(date, timezone) {
+  return Utilities.formatDate(date, timezone, 'h:mm a');
+}
+
+/**
+ * Formats date and time together
+ * @param {Date} date - Date object
+ * @param {string} timezone - Timezone string
+ * @return {string} Formatted datetime string
+ */
+function formatDateTime(date, timezone) {
+  return formatDate(date, timezone) + ' at ' + formatTime(date, timezone);
+}
+
+/**
+ * Safely converts value to string
+ * @param {*} value - Value to convert
+ * @return {string} String value or empty string
+ */
+function safeString(value) {
+  return (value || '').toString().trim();
+}
+
+/**
+ * Replaces template placeholders with values
+ * @param {string} template - Template string with {placeholder} syntax
+ * @param {Object} values - Object with placeholder values
+ * @return {string} Replaced string
+ */
+function replaceTemplate(template, values) {
+  let result = template;
+  for (const [key, value] of Object.entries(values)) {
+    result = result.replace(new RegExp('\\{' + key + '\\}', 'g'), value || '');
+  }
+  return result;
+}
+
+/**
+ * Logs a section header
+ * @param {string} title - Section title
+ * @param {string} subtitle - Optional subtitle
+ */
+function logSection(title, subtitle) {
+  Logger.log('');
+  Logger.log('=== ' + title + ' ===');
+  if (subtitle) Logger.log(subtitle);
+  Logger.log('Timestamp: ' + new Date().toLocaleString());
+  Logger.log('');
+}
+
+/**
+ * Handles errors and logs to sheet
+ * @param {Error} error - Error object
+ * @param {GoogleAppsScript.Events.FormsOnFormSubmit} e - Form submit event
+ */
+function handleError(error, e) {
+  Logger.log('Error in onFormSubmit: ' + error.toString());
+  Logger.log('Stack trace: ' + error.stack);
+  
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME);
+    if (sheet) {
+      const errorRow = (e && e.range) ? e.range.getRow() : sheet.getLastRow();
+      if (errorRow >= 1) {
+        updateSheetStatus(sheet, errorRow, STATUS.ERROR, `Error: ${error.toString()}`);
+      }
+    }
+  } catch (e) {
+    MailApp.sendEmail(CONFIG.SCHEDULER_EMAIL, 'Scheduling System Error', error.toString());
+  }
+}
+
+// ============================================================================
+// SETUP FUNCTION - Run this once to set up the trigger
+// ============================================================================
+
+/**
+ * SETUP FUNCTION - Run this once manually to set up the form submission trigger
+ * Go to Apps Script editor > Run > setupFormTrigger
+ */
+function setupFormTrigger() {
+  const form = FormApp.getActiveForm();
+  if (!form) {
+    Logger.log('No active form found. Make sure you open the form first.');
+    return;
+  }
+  
+  const triggers = ScriptApp.getProjectTriggers();
+  const existingTrigger = triggers.find(trigger => 
+    trigger.getEventType() === ScriptApp.EventType.ON_FORM_SUBMIT
+  );
+  
+  if (existingTrigger) {
+    Logger.log('Form submission trigger already exists');
+    return;
+  }
+  
+  ScriptApp.newTrigger('onFormSubmit')
+    .onFormSubmit()
+    .create();
+  
+  Logger.log('Form submission trigger created successfully!');
+}
+
+// ============================================================================
+// VALIDATION FUNCTION - Check if column order is correct
+// ============================================================================
+
+/**
+ * VALIDATION FUNCTION - Run this to verify your spreadsheet column order
+ * Go to Apps Script editor > Run > validateColumnOrder
+ */
+function validateColumnOrder() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME);
+  if (!sheet) {
+    Logger.log('ERROR: Sheet "' + CONFIG.SHEET_NAME + '" not found');
+    return;
+  }
+  
+  const expectedHeaders = [
+    'Timestamp', 'Name', 'Email', 'Profile Link', 'Phone', 'Notes',
+    'Preferred Time Window', 'Preferred Dates', 'Status', 'Meeting Time',
+    'Assigned Slot (ISO)', 'Timezone', 'Calendar Event ID', 'Log'
+  ];
+  
+  const headerRange = sheet.getRange(1, 1, 1, expectedHeaders.length);
+  const actualHeaders = headerRange.getValues()[0];
+  
+  Logger.log('=== COLUMN ORDER VALIDATION ===');
+  Logger.log('');
+  
+  let hasErrors = false;
+  
+  for (let i = 0; i < expectedHeaders.length; i++) {
+    const columnLetter = String.fromCharCode(65 + i);
+    const expected = expectedHeaders[i];
+    const actual = actualHeaders[i] || '(empty)';
+    
+    if (!actual || actual.toString().trim() === '') {
+      Logger.log('⚠️  Column ' + columnLetter + ': EMPTY (Expected: "' + expected + '")');
+      hasErrors = true;
+    } else {
+      Logger.log('✓  Column ' + columnLetter + ': "' + actual + '" (Expected: "' + expected + '")');
+    }
+  }
+  
+  Logger.log('');
+  Logger.log('=== IMPORTANT NOTES ===');
+  Logger.log('1. The script reads by POSITION, not by header name');
+  Logger.log('2. Column ORDER is critical - positions must match');
+  Logger.log('3. Header spelling doesn\'t affect the script, but should be clear for humans');
+  Logger.log('4. Form fields must be in the same order as columns A-G');
+  Logger.log('');
+  
+  if (hasErrors) {
+    Logger.log('⚠️  WARNING: Some columns are empty or missing!');
+  } else {
+    Logger.log('✅ Column structure looks good!');
+  }
+}
+
+// ============================================================================
+// TEST FUNCTION - Use this to test the script manually
+// ============================================================================
+
+/**
+ * TEST FUNCTION - Use this to test the script with sample data
+ * Go to Apps Script editor > Run > testScript
+ */
+function testScript() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME);
+  if (!sheet) {
+    Logger.log('ERROR: Sheet "' + CONFIG.SHEET_NAME + '" not found');
+    return;
+  }
+  
+  const lastRow = sheet.getLastRow();
+  const firstDataRow = getFirstDataRow(sheet);
+  
+  if (lastRow < firstDataRow) {
+    Logger.log('ERROR: No form submissions found!');
+    return;
+  }
+  
+  if (isHeaderRow(sheet, lastRow)) {
+    Logger.log('ERROR: Last row appears to be headers!');
+    return;
+  }
+  
+  const formData = readFormData(sheet, lastRow);
+  
+  if (formData.status === STATUS.CONFIRMED || formData.status === STATUS.REJECTED) {
+    Logger.log('This submission is already processed (Status: ' + formData.status + ')');
+    return;
+  }
+  
+  Logger.log('Processing submission for: ' + formData.name + ' (' + formData.email + ')');
+  processSubmission(sheet, formData, lastRow);
+}
+
+/**
+ * PROCESS ALL PENDING - Process all unprocessed form submissions
+ * Go to Apps Script editor > Run > processAllPending
+ */
+function processAllPending() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME);
+  if (!sheet) {
+    Logger.log('ERROR: Sheet "' + CONFIG.SHEET_NAME + '" not found');
+    return;
+  }
+  
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 1) {
+    Logger.log('No form submissions found');
+    return;
+  }
+  
+  Logger.log('Processing all pending submissions...');
+  
+  let processed = 0;
+  let skipped = 0;
+  let errors = 0;
+  
+  const firstDataRow = getFirstDataRow(sheet);
+  
+  for (let row = firstDataRow; row <= lastRow; row++) {
+    if (isHeaderRow(sheet, row)) {
+      skipped++;
+      continue;
+    }
+    
+    const formData = readFormData(sheet, row);
+    
+    if (formData.status === STATUS.CONFIRMED || formData.status === STATUS.REJECTED) {
+      skipped++;
+      continue;
+    }
+    
+    if (!isValidFormData(formData)) {
+      updateSheetStatus(sheet, row, STATUS.ERROR, 'Missing required fields');
+      errors++;
+      continue;
+    }
+    
+    try {
+      processSubmission(sheet, formData, row);
+      processed++;
+    } catch (error) {
+      Logger.log('  ✗ Error: ' + error.toString());
+      updateSheetStatus(sheet, row, STATUS.ERROR, 'Error: ' + error.toString());
+      errors++;
+    }
+  }
+  
+  Logger.log('');
+  Logger.log('=== SUMMARY ===');
+  Logger.log('Processed: ' + processed);
+  Logger.log('Skipped: ' + skipped);
+  Logger.log('Errors: ' + errors);
+}
